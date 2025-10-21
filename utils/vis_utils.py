@@ -4,18 +4,86 @@ import ipywidgets as widgets
 import pandas as pd
 from typing import Union
 from io import BytesIO
-from pathlib import Path 
+from pathlib import Path
+from tqdm import tqdm 
 from PIL import Image, ImageDraw, ImageFont, ImageChops
 from IPython.display import display, clear_output
 from rdkit import Chem
 from rdkit.Chem import AllChem, Crippen
 from rdkit.Chem.Draw import rdMolDraw2D
 from rdkit import RDLogger
+from multiprocessing import Pool, cpu_count
+
 
 from .rxn_vis import visualize_reactions, reactions_from_syn
 from . import prolif_utils
 
 RDLogger.DisableLog('rdApp.*') 
+
+def mol_from_smiles(smi):
+    return Chem.MolFromSmiles(smi)
+
+def clogp(mol): 
+    return Crippen.MolLogP(mol)
+
+def initialize_df(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Precompute molecular descriptors and auxiliary columns.
+
+    Inputs:
+        df (pd.DataFrame): Dataset with SMILES and related columns.
+
+    Outputs:
+        tuple[pd.DataFrame, pd.DataFrame]: (Original DataFrame, filtered copy).
+    """
+    # mols = [Chem.MolFromSmiles(smi) for smi in tqdm(df['SMILES'], desc='Chem.MolToSmiles')]
+    n_proc = 16
+
+    with Pool(n_proc) as pool:    
+    
+        mols = list(tqdm(
+            pool.imap(mol_from_smiles, df['SMILES'], chunksize=5000), 
+            total=len(df), desc='Chem.MolFromSmiles'
+        ))
+
+    guanidine = Chem.MolFromSmarts('[N]~[C](~[N])~[N]')
+    df['Contains guanidium'] = [
+        m.HasSubstructMatch(guanidine)
+        for m in tqdm(mols, desc='Contains guanidinium')
+    ]
+
+    aminoimidazole = Chem.MolFromSmarts('[N]~[c](~[n])~[n]')
+    df['Contains 2-aminoimidazole'] = [
+        m.HasSubstructMatch(aminoimidazole)
+        for m in tqdm(mols, desc='Contains 2-aminoimidazole')
+    ]
+
+    with Pool(n_proc) as pool:    
+
+        df['cLogP'] = list(tqdm(
+            pool.imap(clogp, mols, chunksize=5000), 
+            total=len(df), desc='Crippen.cLogP'
+        ))
+        # [Crippen.MolLogP(m) for m in tqdm(mols, desc='cLogP')]
+    
+    names = {
+        p.stem.split('_')[-1] for p in Path('data/redocked').glob('call_*')
+    }
+    df['Redocked'] = [
+        f'data/redocked/call_{name}.sdf'
+        if str(name) in names else None
+        for name in df['Oracle call']
+    ]
+
+    with open('data/projection_buffer.json', 'r') as f:
+        projection_buffer = json.load(f)
+    
+    syntheses = {val[0]: val[1] for val in projection_buffer.values()}
+    df['Synthesis'] = [
+        syntheses.get(smi, '')
+        for smi in tqdm(df['SMILES'], desc='Getting synthesis')
+    ]
+
+    return df
 
 def mol_to_image(
     smiles: str,
@@ -333,7 +401,8 @@ class MoleculeGridSelectorWithFilters:
             'Max consecutive rotatable bonds', 'Unbound H bond donors',
             'Interacts with water', 'Interacts with ASP'
         """
-        self.df, self.filtered_df = self.initialize_df(df)
+        self.df = df
+        self.filtered_df = df.copy()
         self.page_size = n_rows*n_cols
         self.n_rows = n_rows
         self.n_cols = n_cols
